@@ -98,19 +98,10 @@ class BiometricStorageFile(
         val useCipher = cipher ?: cipherForEncrypt()
         try {
             val encrypted = cryptographyManager.encryptData(content, useCipher)
-
-            // Użyj atomic write pattern
-            val tempFile = File(fileV2.parentFile, "${fileV2.name}.tmp")
-            tempFile.writeBytes(encrypted.encryptedPayload)
-            tempFile.outputStream().use { it.fd.sync() } // Force sync to disk
-
-            if (!tempFile.renameTo(fileV2)) {
-                tempFile.delete()
-                throw IOException("Failed to atomically replace file")
-            }
+            fileV2.writeBytes(encrypted.encryptedPayload)
 
             logger.debug { "Successfully written ${encrypted.encryptedPayload.size} bytes." }
-            performSelfCheck(content)
+//            performSelfCheck(content)
         } catch (ex: IOException) {
             // Error occurred opening file for writing.
             logger.error(ex) { "Error while writing encrypted file $fileV2" }
