@@ -112,6 +112,7 @@ class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
     private lateinit var applicationContext: Context
 
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        setupAndroidLogging()
         this.applicationContext = binding.applicationContext
         val channel = MethodChannel(binding.binaryMessenger, "biometric_storage")
         channel.setMethodCallHandler(this)
@@ -272,6 +273,9 @@ class BiometricStoragePlugin : FlutterPlugin, ActivityAware, MethodCallHandler {
         } catch (e: MethodCallException) {
             logger.error(e) { "Error while processing method call ${call.method}" }
             result.error(e.errorCode, e.errorMessage, e.errorDetails)
+        } catch (e: MigrationRequiredException) {
+            logger.warn(e) { "Migration required while processing method call '${call.method}'" }
+            result.error("MigrationRequired", e.message, e.toCompleteString())
         } catch (e: Exception) {
             logger.error(e) { "Error while processing method call '${call.method}'" }
             result.error("Unexpected Error", e.message, e.toCompleteString())

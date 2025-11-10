@@ -1,13 +1,23 @@
 package design.codeux.biometric_storage
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.io.File
+import android.security.keystore.UserNotAuthenticatedException
+import io.github.oshai.kotlinlogging.Level
+import javax.crypto.IllegalBlockSizeException
+import java.security.KeyStoreException
 import java.io.IOException
+import java.security.KeyStore
+import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.spec.GCMParameterSpec
 
 private val logger = KotlinLogging.logger {}
 
@@ -17,8 +27,11 @@ data class InitOptions(
     val androidBiometricOnly: Boolean = true
 )
 
+class MigrationRequiredException(cause: Throwable? = null) :
+    RuntimeException("MigrationRequired", cause)
+
 class BiometricStorageFile(
-    context: Context,
+    val context: Context,
     baseName: String,
     val options: InitOptions
 ) {
@@ -29,20 +42,43 @@ class BiometricStorageFile(
          */
         private const val DIRECTORY_NAME = "biometric_storage"
         private const val FILE_SUFFIX_V2 = ".v2.txt"
+        private const val SANDBOX_FLAG_ALIAS = "_CM_is_sandbox_work"
+        private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     }
 
     private val masterKeyName = "${baseName}_master_key"
     private val fileNameV2 = "$baseName$FILE_SUFFIX_V2"
     private val fileV2: File
 
-    private val cryptographyManager = CryptographyManager {
+    private val canUseStrongBox: Boolean by lazy {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+                context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE) &&
+                testStrongBoxSupport(context)
+    }
+
+    private val forceDisableStrongBox: Boolean by lazy {
+        hasSandboxFlag()
+    }
+
+    private var cryptographyManager = CryptographyManager {
+        logToAndroid(Level.DEBUG, "🧩 init cryptographyManager")
         setUserAuthenticationRequired(options.authenticationRequired)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            val useStrongBox = context.packageManager.hasSystemFeature(
-                PackageManager.FEATURE_STRONGBOX_KEYSTORE
-            )
-            setIsStrongBoxBacked(useStrongBox)
+            if (forceDisableStrongBox) {
+                logToAndroid(Level.DEBUG, "🧩 StrongBox DISABLED by migration flag for $masterKeyName")
+                logger.debug { "StrongBox DISABLED by migration flag for $masterKeyName" }
+                setIsStrongBoxBacked(false)
+            } else if (canUseStrongBox) {
+                logToAndroid(Level.DEBUG, "🧩 Using StrongBox-backed key for $masterKeyName")
+                logger.debug { "Using StrongBox-backed key for $masterKeyName" }
+                setIsStrongBoxBacked(true)
+            } else {
+                logToAndroid(Level.DEBUG, "🧩 StrongBox not available, using TEE for $masterKeyName")
+                logger.debug { "StrongBox not available, using TEE for $masterKeyName" }
+                setIsStrongBoxBacked(false)
+            }
         }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (options.authenticationValidityDurationSeconds == -1) {
                 setUserAuthenticationParameters(
@@ -92,7 +128,7 @@ class BiometricStorageFile(
 
     @Synchronized
     fun writeFile(cipher: Cipher?, content: String) {
-        // cipher will be null if user does not need authentication or valid period is > -1
+        logToAndroid(Level.DEBUG, "🧩writeFile")
         val useCipher = cipher ?: cipherForEncrypt()
         try {
             val encrypted = cryptographyManager.encryptData(content, useCipher)
@@ -107,23 +143,62 @@ class BiometricStorageFile(
         }
     }
 
+
     @Synchronized
     fun readFile(cipher: Cipher?): String? {
         val useCipher = cipher ?: cipherForDecrypt()
-        // if the file exists, there should *always* be a decryption key.
-        if (useCipher != null && fileV2.exists()) {
-            return try {
-                val bytes = fileV2.readBytes()
-                logger.debug { "read ${bytes.size}" }
-                cryptographyManager.decryptData(bytes, useCipher)
-            } catch (ex: IOException) {
-                logger.error(ex) { "Error while writing encrypted file $fileV2" }
-                null
-            }
+
+        if (!fileV2.exists()) {
+            logger.debug { "File $fileV2 does not exist. returning null." }
+            return null
         }
 
-        logger.debug { "File $fileV2 does not exist. returning null." }
-        return null
+        if (useCipher == null) {
+            return null
+        }
+
+        return try {
+            val bytes = fileV2.readBytes()
+            logger.debug { "read ${bytes.size} bytes from $fileV2" }
+            cryptographyManager.decryptData(bytes, useCipher)
+        } catch (ex: IOException) {
+            logger.error(ex) { "IO error while reading encrypted file $fileV2" }
+            null
+        } catch (@SuppressLint("NewApi") ex: AEADBadTagException) {
+            logger.error(ex) {
+                "AEADBadTagException while decrypting $fileV2 — deleting key+file and triggering migration"
+            }
+            logToAndroid(
+                Level.DEBUG,
+                "🧩AEADBadTagException while decrypting $fileV2 — deleting key+file and triggering migration"
+            )
+            safeDeleteKeyAndFile()
+            setSandboxFlag()
+            throw MigrationRequiredException()
+        } catch (ex: IllegalBlockSizeException) {
+            logger.error(ex) {
+                "IllegalBlockSizeException while decrypting $fileV2 — deleting key+file and triggering migration"
+            }
+            logToAndroid(
+                Level.DEBUG,
+                "🧩IllegalBlockSizeException while decrypting $fileV2 — deleting key+file and triggering migration"
+            )
+            safeDeleteKeyAndFile()
+            setSandboxFlag()
+            throw MigrationRequiredException(ex)
+        } catch (ex: Exception) {
+            //TODO what about wrong finger or face
+            logger.error(ex) {
+                "Unexpected crypto error while decrypting $fileV2 — deleting key+file and triggering migration"
+            }
+            logToAndroid(
+                Level.DEBUG,
+                "Unexpected crypto error while decrypting $fileV2 — deleting key+file and triggering migration"
+            )
+            safeDeleteKeyAndFile()
+            setSandboxFlag()
+            throw MigrationRequiredException(ex)
+        }
 
     }
 
@@ -141,4 +216,112 @@ class BiometricStorageFile(
         logger.trace { "dispose" }
     }
 
+    private fun testStrongBoxSupport(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
+
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val testKeyName = "STRONGBOX_TEST_KEY"
+
+        return try {
+            val builder = KeyGenParameterSpec.Builder(
+                testKeyName,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256)
+                .setUserAuthenticationRequired(true)
+                .setIsStrongBoxBacked(true)
+
+            val keyGenerator = KeyGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_AES,
+                "AndroidKeyStore"
+            )
+            keyGenerator.init(builder.build())
+            val key = keyGenerator.generateKey()
+
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, key)
+            val iv = cipher.iv
+            val encrypted = cipher.doFinal("test".toByteArray())
+
+            val decCipher = Cipher.getInstance("AES/GCM/NoPadding")
+            decCipher.init(
+                Cipher.DECRYPT_MODE,
+                key,
+                GCMParameterSpec(128, iv)
+            )
+            val decrypted = String(decCipher.doFinal(encrypted))
+
+            decrypted == "test"
+        } catch (e: Exception) {
+            false
+        } finally {
+            try {
+                ks.deleteEntry(testKeyName)
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun hasSandboxFlag(): Boolean {
+        return try {
+            val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            ks.containsAlias(SANDBOX_FLAG_ALIAS)
+        } catch (e: Exception) {
+            logger.error(e) { "Error checking sandbox flag" }
+            false
+        }
+    }
+
+    private fun setSandboxFlag() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            logger.warn { "Sandbox flag not supported on API < 23" }
+            return
+        }
+
+        try {
+            val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (ks.containsAlias(SANDBOX_FLAG_ALIAS)) return
+
+            val generator = KeyGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_AES,
+                ANDROID_KEYSTORE
+            )
+
+            val spec = KeyGenParameterSpec.Builder(
+                SANDBOX_FLAG_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setKeySize(128)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setUserAuthenticationRequired(false)
+                .build()
+
+            generator.init(spec)
+            generator.generateKey()
+
+            logger.warn { "Sandbox flag created — StrongBox disabled for future keys" }
+
+        } catch (e: Exception) {
+            logger.error(e) { "Failed to create sandbox flag" }
+        }
+    }
+
+    private fun safeDeleteKeyAndFile() {
+        try {
+            cryptographyManager.deleteKey(masterKeyName)
+        } catch (e: Exception) {
+            logger.warn(e) { "Failed to delete master key $masterKeyName during migration" }
+        }
+
+        try {
+            if (fileV2.exists()) {
+                fileV2.delete()
+            }
+        } catch (e: Exception) {
+            logger.warn(e) { "Failed to delete file $fileV2 during migration" }
+        }
+    }
 }
