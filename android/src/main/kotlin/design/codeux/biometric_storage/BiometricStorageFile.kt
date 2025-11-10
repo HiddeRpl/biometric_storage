@@ -7,6 +7,7 @@ import android.security.keystore.KeyProperties
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.io.File
 import java.io.IOException
+import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
 
 private val logger = KotlinLogging.logger {}
@@ -18,7 +19,7 @@ data class InitOptions(
 )
 
 class BiometricStorageFile(
-    context: Context,
+    val context: Context,
     baseName: String,
     val options: InitOptions
 ) {
@@ -35,13 +36,27 @@ class BiometricStorageFile(
     private val fileNameV2 = "$baseName$FILE_SUFFIX_V2"
     private val fileV2: File
 
-    private val cryptographyManager = CryptographyManager {
+    private var cryptographyManager = createCryptographyManager(context)
+
+    init {
+        val baseDir = File(context.filesDir, DIRECTORY_NAME)
+        if (!baseDir.exists()) {
+            baseDir.mkdirs()
+        }
+        fileV2 = File(baseDir, fileNameV2)
+
+        logger.trace { "Initialized $this with $options" }
+
+        validateOptions()
+    }
+
+    private fun createCryptographyManager(context: Context, shouldOmitStrongbox: Boolean = false) = CryptographyManager {
         setUserAuthenticationRequired(options.authenticationRequired)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             val useStrongBox = context.packageManager.hasSystemFeature(
                 PackageManager.FEATURE_STRONGBOX_KEYSTORE
             )
-            setIsStrongBoxBacked(useStrongBox)
+            setIsStrongBoxBacked(useStrongBox && !shouldOmitStrongbox)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (options.authenticationValidityDurationSeconds == -1) {
@@ -59,18 +74,6 @@ class BiometricStorageFile(
             @Suppress("DEPRECATION")
             setUserAuthenticationValidityDurationSeconds(options.authenticationValidityDurationSeconds)
         }
-    }
-
-    init {
-        val baseDir = File(context.filesDir, DIRECTORY_NAME)
-        if (!baseDir.exists()) {
-            baseDir.mkdirs()
-        }
-        fileV2 = File(baseDir, fileNameV2)
-
-        logger.trace { "Initialized $this with $options" }
-
-        validateOptions()
     }
 
     private fun validateOptions() {
@@ -98,13 +101,34 @@ class BiometricStorageFile(
             val encrypted = cryptographyManager.encryptData(content, useCipher)
             fileV2.writeBytes(encrypted.encryptedPayload)
             logger.debug { "Successfully written ${encrypted.encryptedPayload.size} bytes." }
-
+            performSelfCheck(content)
             return
         } catch (ex: IOException) {
             // Error occurred opening file for writing.
             logger.error(ex) { "Error while writing encrypted file $fileV2" }
             throw ex
         }
+    }
+
+    private fun performSelfCheck(content: String) {
+        try {
+            val decryptCipher = cryptographyManager.getInitializedCipherForDecryption(masterKeyName, fileV2)
+            val decrypted = cryptographyManager.decryptData(fileV2.readBytes(), decryptCipher)
+            if (decrypted != content) throw IllegalStateException("Self-check failed: decrypted content mismatch")
+            logger.debug { "Self-check successful — key is valid" }
+        } catch (ex: AEADBadTagException) {
+            handleStrongBoxFallback(content)
+        }
+    }
+
+    private fun handleStrongBoxFallback(content: String) {
+        logger.error { "StrongBox key test failed, falling back to normal keystore" }
+        cryptographyManager.deleteKey(masterKeyName)
+        cryptographyManager = createCryptographyManager(context, shouldOmitStrongbox = true)
+        val fallbackCipher = cryptographyManager.getInitializedCipherForEncryption(masterKeyName)
+        val reEncrypted = cryptographyManager.encryptData(content, fallbackCipher)
+        fileV2.writeBytes(reEncrypted.encryptedPayload)
+        logger.info { "Re-encrypted data using fallback (non-StrongBox) key" }
     }
 
     @Synchronized
