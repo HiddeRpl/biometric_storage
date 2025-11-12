@@ -45,22 +45,20 @@ class BiometricStorageFile(
             setIsStrongBoxBacked(useStrongBox)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (options.androidAuthenticationValidityDuration == null) {
+            if (options.authenticationValidityDurationSeconds == -1) {
                 setUserAuthenticationParameters(
                     0,
                     KeyProperties.AUTH_BIOMETRIC_STRONG
                 )
             } else {
                 setUserAuthenticationParameters(
-                    options.androidAuthenticationValidityDuration.inWholeSeconds.toInt(),
+                    options.authenticationValidityDurationSeconds,
                     KeyProperties.AUTH_DEVICE_CREDENTIAL or KeyProperties.AUTH_BIOMETRIC_STRONG
                 )
             }
         } else {
             @Suppress("DEPRECATION")
-            setUserAuthenticationValidityDurationSeconds(
-                options.androidAuthenticationValidityDuration?.inWholeSeconds?.toInt() ?: -1
-            )
+            setUserAuthenticationValidityDurationSeconds(options.authenticationValidityDurationSeconds)
         }
     }
 
@@ -128,22 +126,20 @@ class BiometricStorageFile(
                     setUserAuthenticationRequired(options.authenticationRequired)
 
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        if (options.androidAuthenticationValidityDuration == null) {
+                        if (options.authenticationValidityDurationSeconds == -1) {
                             setUserAuthenticationParameters(
                                 0,
                                 KeyProperties.AUTH_BIOMETRIC_STRONG
                             )
                         } else {
                             setUserAuthenticationParameters(
-                                options.androidAuthenticationValidityDuration.inWholeSeconds.toInt(),
+                                options.authenticationValidityDurationSeconds,
                                 KeyProperties.AUTH_DEVICE_CREDENTIAL or KeyProperties.AUTH_BIOMETRIC_STRONG
                             )
                         }
                     } else {
                         @Suppress("DEPRECATION")
-                        setUserAuthenticationValidityDurationSeconds(
-                            options.androidAuthenticationValidityDuration?.inWholeSeconds?.toInt() ?: -1
-                        )
+                        setUserAuthenticationValidityDurationSeconds(options.authenticationValidityDurationSeconds)
                     }
 
                     // ❌ Bez StrongBox
