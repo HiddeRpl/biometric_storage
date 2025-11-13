@@ -191,6 +191,7 @@ class BiometricStorageFile(
         return try {
             logger.debug { "Testing StrongBox support..." }
             logToAndroid(Level.DEBUG, "🧩Testing StrongBox support...")
+            return false
 
             val keyStore = java.security.KeyStore.getInstance("AndroidKeyStore").apply {
                 load(null)
