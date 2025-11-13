@@ -1,11 +1,17 @@
 package design.codeux.biometric_storage
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
+import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import io.github.oshai.kotlinlogging.KotlinLogging
 import java.io.File
+import android.security.keystore.UserNotAuthenticatedException
+import io.github.oshai.kotlinlogging.Level
+import javax.crypto.IllegalBlockSizeException
+import java.security.KeyStoreException
 import java.io.IOException
 import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
@@ -17,6 +23,9 @@ data class InitOptions(
     val authenticationRequired: Boolean = true,
     val androidBiometricOnly: Boolean = true
 )
+
+class MigrationRequiredException(cause: Throwable? = null) :
+    Exception("MigrationRequired", cause)
 
 class BiometricStorageFile(
     val context: Context,
@@ -36,14 +45,25 @@ class BiometricStorageFile(
     private val fileNameV2 = "$baseName$FILE_SUFFIX_V2"
     private val fileV2: File
 
+    private val canUseStrongBox: Boolean by lazy {
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
+                context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE) &&
+                testStrongBoxKey()
+    }
+
     private var cryptographyManager = CryptographyManager {
         setUserAuthenticationRequired(options.authenticationRequired)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            val useStrongBox = context.packageManager.hasSystemFeature(
-                PackageManager.FEATURE_STRONGBOX_KEYSTORE
-            )
-            setIsStrongBoxBacked(useStrongBox)
+            if (canUseStrongBox) {
+                logToAndroid(Level.DEBUG, "🧩 Using StrongBox-backed key for $masterKeyName")
+                logger.debug { "Using StrongBox-backed key for $masterKeyName" }
+                setIsStrongBoxBacked(true)
+            } else {
+                logToAndroid(Level.DEBUG, "🧩 StrongBox not available")
+                logger.debug { "StrongBox not available or failed test, falling back to TEE for $masterKeyName" }
+            }
         }
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (options.authenticationValidityDurationSeconds == -1) {
                 setUserAuthenticationParameters(
@@ -93,93 +113,63 @@ class BiometricStorageFile(
 
     @Synchronized
     fun writeFile(cipher: Cipher?, content: String) {
+        logToAndroid(Level.DEBUG, "🧩writeFile")
         val useCipher = cipher ?: cipherForEncrypt()
         try {
             val encrypted = cryptographyManager.encryptData(content, useCipher)
             fileV2.writeBytes(encrypted.encryptedPayload)
             logger.debug { "Successfully written ${encrypted.encryptedPayload.size} bytes." }
 
-            // Self-test
-            try {
-                val decryptCipher = cryptographyManager.getInitializedCipherForDecryption(
-                    masterKeyName,
-                    fileV2
-                )
-                val decrypted = cryptographyManager.decryptData(
-                    fileV2.readBytes(),
-                    decryptCipher
-                )
-
-                if (decrypted != content) {
-                    throw IllegalStateException("Self-check failed: decrypted content mismatch")
-                }
-
-                logger.debug { "Self-check successful — key is valid" }
-            } catch (innerEx: Exception) {
-                logger.error(innerEx) { "StrongBox key test failed, falling back to normal keystore" }
-
-                // ⚙️ 1. Usuwamy klucz
-                cryptographyManager.deleteKey(masterKeyName)
-
-                // ⚙️ 2. reinit cryptographyManager bez StrongBox
-                val fallbackManager = CryptographyManager {
-                    setUserAuthenticationRequired(options.authenticationRequired)
-
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                        if (options.authenticationValidityDurationSeconds == -1) {
-                            setUserAuthenticationParameters(
-                                0,
-                                KeyProperties.AUTH_BIOMETRIC_STRONG
-                            )
-                        } else {
-                            setUserAuthenticationParameters(
-                                options.authenticationValidityDurationSeconds,
-                                KeyProperties.AUTH_DEVICE_CREDENTIAL or KeyProperties.AUTH_BIOMETRIC_STRONG
-                            )
-                        }
-                    } else {
-                        @Suppress("DEPRECATION")
-                        setUserAuthenticationValidityDurationSeconds(options.authenticationValidityDurationSeconds)
-                    }
-
-                    // ❌ Bez StrongBox
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                        setIsStrongBoxBacked(false)
-                    }
-                }
-
-                val fallbackCipher = fallbackManager.getInitializedCipherForEncryption(masterKeyName)
-                val reEncrypted = fallbackManager.encryptData(content, fallbackCipher)
-                fileV2.writeBytes(reEncrypted.encryptedPayload)
-
-                logger.info { "Re-encrypted data using fallback (non-StrongBox) key" }
-
-                this.cryptographyManager = fallbackManager
-            }
-
+            return
         } catch (ex: IOException) {
+            // Error occurred opening file for writing.
             logger.error(ex) { "Error while writing encrypted file $fileV2" }
             throw ex
         }
     }
 
+
     @Synchronized
     fun readFile(cipher: Cipher?): String? {
+        logToAndroid(Level.DEBUG, "🧩readFile $canUseStrongBox | testStrongBoxKey: ${testStrongBoxKey()}")
         val useCipher = cipher ?: cipherForDecrypt()
-        // if the file exists, there should *always* be a decryption key.
-        if (useCipher != null && fileV2.exists()) {
-            return try {
-                val bytes = fileV2.readBytes()
-                logger.debug { "read ${bytes.size}" }
-                cryptographyManager.decryptData(bytes, useCipher)
-            } catch (ex: IOException) {
-                logger.error(ex) { "Error while writing encrypted file $fileV2" }
-                null
-            }
+
+        if (!fileV2.exists()) {
+            logger.debug { "File $fileV2 does not exist. returning null." }
+            return null
         }
 
-        logger.debug { "File $fileV2 does not exist. returning null." }
-        return null
+        if(useCipher == null) {
+            return null
+        }
+
+        return try {
+            val bytes = fileV2.readBytes()
+            logger.debug { "read ${bytes.size} bytes from $fileV2" }
+            cryptographyManager.decryptData(bytes, useCipher)
+        } catch (ex: IOException) {
+            logger.error(ex) { "IO error while reading encrypted file $fileV2" }
+            null
+        } catch (@SuppressLint("NewApi") ex: AEADBadTagException) {
+            logger.error(ex) {
+                "AEADBadTagException while decrypting $fileV2 — deleting key+file and triggering migration"
+            }
+            deleteFile()
+            throw MigrationRequiredException()
+        } catch (ex: IllegalBlockSizeException) {
+            logger.error(ex) {
+                "IllegalBlockSizeException while decrypting $fileV2 — deleting key+file and triggering migration"
+            }
+            deleteFile()
+            throw MigrationRequiredException(ex)
+        } catch (ex: Exception) {
+            //TODO what about wrong finger or face
+            logger.error(ex) {
+                "Unexpected crypto error while decrypting $fileV2 — deleting key+file and triggering migration"
+            }
+            deleteFile()
+            throw MigrationRequiredException(ex)
+        }
 
     }
 
@@ -197,4 +187,57 @@ class BiometricStorageFile(
         logger.trace { "dispose" }
     }
 
+    private fun testStrongBoxKey(): Boolean {
+        return try {
+            logger.debug { "Testing StrongBox support..." }
+            logToAndroid(Level.DEBUG, "🧩Testing StrongBox support...")
+
+            val keyStore = java.security.KeyStore.getInstance("AndroidKeyStore").apply {
+                load(null)
+            }
+
+            val alias = "_BS_STRONGBOX_TEST_KEY"
+
+            try {
+                keyStore.deleteEntry(alias)
+            } catch (_: Exception) {
+            }
+
+            val keyGenerator = javax.crypto.KeyGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_AES,
+                "AndroidKeyStore"
+            )
+
+            val spec = KeyGenParameterSpec.Builder(
+                alias,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256)
+                .setIsStrongBoxBacked(true)
+                .build()
+
+            keyGenerator.init(spec)
+            val key = keyGenerator.generateKey()
+
+            val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, key)
+            cipher.doFinal("test".toByteArray(Charsets.UTF_8))
+
+            logToAndroid(Level.DEBUG, "🧩StrongBox self-test succeeded")
+            logger.debug { "StrongBox self-test succeeded" }
+
+            try {
+                keyStore.deleteEntry(alias)
+            } catch (_: Exception) {
+            }
+
+            true
+        } catch (e: Exception) {
+            logger.warn(e) { "StrongBox self-test failed, fallback to TEE" }
+            logToAndroid(Level.DEBUG, "🧩StrongBox self-test failed, fallback to TEE")
+            false
+        }
+    }
 }
