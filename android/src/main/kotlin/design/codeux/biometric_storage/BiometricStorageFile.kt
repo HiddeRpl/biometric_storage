@@ -13,8 +13,11 @@ import io.github.oshai.kotlinlogging.Level
 import javax.crypto.IllegalBlockSizeException
 import java.security.KeyStoreException
 import java.io.IOException
+import java.security.KeyStore
 import javax.crypto.AEADBadTagException
 import javax.crypto.Cipher
+import javax.crypto.KeyGenerator
+import javax.crypto.spec.GCMParameterSpec
 
 private val logger = KotlinLogging.logger {}
 
@@ -48,7 +51,7 @@ class BiometricStorageFile(
     private val canUseStrongBox: Boolean by lazy {
         Build.VERSION.SDK_INT >= Build.VERSION_CODES.P &&
                 context.packageManager.hasSystemFeature(PackageManager.FEATURE_STRONGBOX_KEYSTORE) &&
-                testStrongBoxKey()
+                testStrongBoxSupport(context)
     }
 
     private var cryptographyManager = CryptographyManager {
@@ -131,7 +134,11 @@ class BiometricStorageFile(
 
     @Synchronized
     fun readFile(cipher: Cipher?): String? {
-        logToAndroid(Level.DEBUG, "🧩readFile $canUseStrongBox | testStrongBoxKey: ${testStrongBoxKey()}")
+        //TODO remove this log
+        logToAndroid(
+            Level.DEBUG,
+            "🧩readFile $canUseStrongBox | testStrongBoxKey: ${testStrongBoxSupport(context)}"
+        )
         val useCipher = cipher ?: cipherForDecrypt()
 
         if (!fileV2.exists()) {
@@ -139,7 +146,7 @@ class BiometricStorageFile(
             return null
         }
 
-        if(useCipher == null) {
+        if (useCipher == null) {
             return null
         }
 
@@ -187,58 +194,54 @@ class BiometricStorageFile(
         logger.trace { "dispose" }
     }
 
-    private fun testStrongBoxKey(): Boolean {
+    private fun testStrongBoxSupport(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
+
+        val tempKeyName = "TEMP_SB_TEST_KEY"
+        val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+
+        // спробувати створити StrongBox ключ
         return try {
-            logger.debug { "Testing StrongBox support..." }
-            logToAndroid(Level.DEBUG, "🧩Testing StrongBox support...")
-            return false
-
-            val keyStore = java.security.KeyStore.getInstance("AndroidKeyStore").apply {
-                load(null)
-            }
-
-            val alias = "_BS_STRONGBOX_TEST_KEY"
-
-            try {
-                keyStore.deleteEntry(alias)
-            } catch (_: Exception) {
-            }
-
-            val keyGenerator = javax.crypto.KeyGenerator.getInstance(
-                KeyProperties.KEY_ALGORITHM_AES,
-                "AndroidKeyStore"
-            )
-
-            val spec = KeyGenParameterSpec.Builder(
-                alias,
+            val builder = KeyGenParameterSpec.Builder(
+                tempKeyName,
                 KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
             )
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .setKeySize(256)
+                .setUserAuthenticationRequired(false)
                 .setIsStrongBoxBacked(true)
-                .build()
 
-            keyGenerator.init(spec)
+            val keyGenerator = KeyGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_AES,
+                "AndroidKeyStore"
+            )
+
+            keyGenerator.init(builder.build())
             val key = keyGenerator.generateKey()
 
-            val cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding")
-            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, key)
-            cipher.doFinal("test".toByteArray(Charsets.UTF_8))
+            // пробуємо шифрування
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, key)
+            val encrypted = cipher.doFinal("test".toByteArray())
 
-            logToAndroid(Level.DEBUG, "🧩StrongBox self-test succeeded")
-            logger.debug { "StrongBox self-test succeeded" }
-
-            try {
-                keyStore.deleteEntry(alias)
-            } catch (_: Exception) {
-            }
+            // пробуємо розшифрування
+            val decryptCipher = Cipher.getInstance("AES/GCM/NoPadding")
+            decryptCipher.init(
+                Cipher.DECRYPT_MODE,
+                key,
+                GCMParameterSpec(128, cipher.iv)
+            )
+            decryptCipher.doFinal(encrypted)
 
             true
+
         } catch (e: Exception) {
-            logger.warn(e) { "StrongBox self-test failed, fallback to TEE" }
-            logToAndroid(Level.DEBUG, "🧩StrongBox self-test failed, fallback to TEE")
             false
+        } finally {
+            try {
+                ks.deleteEntry(tempKeyName)
+            } catch (_: Exception) {
+            }
         }
     }
 }
