@@ -194,20 +194,20 @@ class BiometricStorageFile(
         logger.trace { "dispose" }
     }
 
-    private fun testStrongBoxSupport(context: Context): Boolean {
+    private fun isStrongBoxWorking(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
 
-        val tempKeyName = "TEMP_SB_TEST_KEY"
         val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        val testKeyName = "STRONGBOX_TEST_KEY"
 
-        // спробувати створити StrongBox ключ
         return try {
             val builder = KeyGenParameterSpec.Builder(
-                tempKeyName,
+                testKeyName,
                 KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
             )
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setKeySize(256)
                 .setUserAuthenticationRequired(false)
                 .setIsStrongBoxBacked(true)
 
@@ -215,33 +215,28 @@ class BiometricStorageFile(
                 KeyProperties.KEY_ALGORITHM_AES,
                 "AndroidKeyStore"
             )
-
             keyGenerator.init(builder.build())
             val key = keyGenerator.generateKey()
 
-            // пробуємо шифрування
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
             cipher.init(Cipher.ENCRYPT_MODE, key)
+            val iv = cipher.iv
             val encrypted = cipher.doFinal("test".toByteArray())
 
-            // пробуємо розшифрування
-            val decryptCipher = Cipher.getInstance("AES/GCM/NoPadding")
-            decryptCipher.init(
+            val decCipher = Cipher.getInstance("AES/GCM/NoPadding")
+            decCipher.init(
                 Cipher.DECRYPT_MODE,
                 key,
-                GCMParameterSpec(128, cipher.iv)
+                GCMParameterSpec(128, iv)
             )
-            decryptCipher.doFinal(encrypted)
+            val decrypted = String(decCipher.doFinal(encrypted))
 
-            true
-
+            decrypted == "test"
         } catch (e: Exception) {
             false
         } finally {
-            try {
-                ks.deleteEntry(tempKeyName)
-            } catch (_: Exception) {
-            }
+            try { ks.deleteEntry(testKeyName) } catch (_: Exception) {}
         }
     }
+
 }
