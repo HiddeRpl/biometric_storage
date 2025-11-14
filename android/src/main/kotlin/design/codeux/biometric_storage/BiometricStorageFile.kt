@@ -61,16 +61,21 @@ class BiometricStorageFile(
     }
 
     private var cryptographyManager = CryptographyManager {
+        logToAndroid(Level.DEBUG, "🧩 init cryptographyManager")
         setUserAuthenticationRequired(options.authenticationRequired)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             if (forceDisableStrongBox) {
-                logToAndroid(Level.DEBUG, "🧩 StrongBox not available")
-                logger.debug { "StrongBox not available or failed test, falling back to TEE for $masterKeyName" }
+                logToAndroid(Level.DEBUG, "🧩 StrongBox DISABLED by migration flag for $masterKeyName")
+                logger.debug { "StrongBox DISABLED by migration flag for $masterKeyName" }
                 setIsStrongBoxBacked(false)
-            } else {
+            } else if (canUseStrongBox) {
                 logToAndroid(Level.DEBUG, "🧩 Using StrongBox-backed key for $masterKeyName")
                 logger.debug { "Using StrongBox-backed key for $masterKeyName" }
-                setIsStrongBoxBacked(canUseStrongBox)
+                setIsStrongBoxBacked(true)
+            } else {
+                logToAndroid(Level.DEBUG, "🧩 StrongBox not available, using TEE for $masterKeyName")
+                logger.debug { "StrongBox not available, using TEE for $masterKeyName" }
+                setIsStrongBoxBacked(false)
             }
         }
 
@@ -141,11 +146,6 @@ class BiometricStorageFile(
 
     @Synchronized
     fun readFile(cipher: Cipher?): String? {
-        //TODO remove this log
-        logToAndroid(
-            Level.DEBUG,
-            "🧩readFile forceDisableStrongBox: $forceDisableStrongBox}"
-        )
         val useCipher = cipher ?: cipherForDecrypt()
 
         if (!fileV2.exists()) {
@@ -168,12 +168,22 @@ class BiometricStorageFile(
             logger.error(ex) {
                 "AEADBadTagException while decrypting $fileV2 — deleting key+file and triggering migration"
             }
+            logToAndroid(
+                Level.DEBUG,
+                "🧩AEADBadTagException while decrypting $fileV2 — deleting key+file and triggering migration"
+            )
+            safeDeleteKeyAndFile()
             setSandboxFlag()
             throw MigrationRequiredException()
         } catch (ex: IllegalBlockSizeException) {
             logger.error(ex) {
                 "IllegalBlockSizeException while decrypting $fileV2 — deleting key+file and triggering migration"
             }
+            logToAndroid(
+                Level.DEBUG,
+                "🧩IllegalBlockSizeException while decrypting $fileV2 — deleting key+file and triggering migration"
+            )
+            safeDeleteKeyAndFile()
             setSandboxFlag()
             throw MigrationRequiredException(ex)
         } catch (ex: Exception) {
@@ -181,6 +191,11 @@ class BiometricStorageFile(
             logger.error(ex) {
                 "Unexpected crypto error while decrypting $fileV2 — deleting key+file and triggering migration"
             }
+            logToAndroid(
+                Level.DEBUG,
+                "Unexpected crypto error while decrypting $fileV2 — deleting key+file and triggering migration"
+            )
+            safeDeleteKeyAndFile()
             setSandboxFlag()
             throw MigrationRequiredException(ex)
         }
@@ -291,6 +306,22 @@ class BiometricStorageFile(
 
         } catch (e: Exception) {
             logger.error(e) { "Failed to create sandbox flag" }
+        }
+    }
+
+    private fun safeDeleteKeyAndFile() {
+        try {
+            cryptographyManager.deleteKey(masterKeyName)
+        } catch (e: Exception) {
+            logger.warn(e) { "Failed to delete master key $masterKeyName during migration" }
+        }
+
+        try {
+            if (fileV2.exists()) {
+                fileV2.delete()
+            }
+        } catch (e: Exception) {
+            logger.warn(e) { "Failed to delete file $fileV2 during migration" }
         }
     }
 }
