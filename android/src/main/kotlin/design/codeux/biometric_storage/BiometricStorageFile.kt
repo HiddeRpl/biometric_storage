@@ -194,7 +194,7 @@ class BiometricStorageFile(
         logger.trace { "dispose" }
     }
 
-    private fun isStrongBoxWorking(): Boolean {
+    private fun testStrongBoxSupport(context: Context): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) return false
 
         val ks = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
