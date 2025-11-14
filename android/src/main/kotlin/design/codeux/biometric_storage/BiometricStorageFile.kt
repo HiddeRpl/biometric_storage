@@ -28,7 +28,7 @@ data class InitOptions(
 )
 
 class MigrationRequiredException(cause: Throwable? = null) :
-    Exception("MigrationRequired", cause)
+    RuntimeException("MigrationRequired", cause)
 
 class BiometricStorageFile(
     val context: Context,
@@ -42,6 +42,8 @@ class BiometricStorageFile(
          */
         private const val DIRECTORY_NAME = "biometric_storage"
         private const val FILE_SUFFIX_V2 = ".v2.txt"
+        private const val SANDBOX_FLAG_ALIAS = "_CM_is_sandbox_work"
+        private const val ANDROID_KEYSTORE = "AndroidKeyStore"
     }
 
     private val masterKeyName = "${baseName}_master_key"
@@ -54,16 +56,21 @@ class BiometricStorageFile(
                 testStrongBoxSupport(context)
     }
 
+    private val forceDisableStrongBox: Boolean by lazy {
+        hasSandboxFlag()
+    }
+
     private var cryptographyManager = CryptographyManager {
         setUserAuthenticationRequired(options.authenticationRequired)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-            if (canUseStrongBox) {
-                logToAndroid(Level.DEBUG, "🧩 Using StrongBox-backed key for $masterKeyName")
-                logger.debug { "Using StrongBox-backed key for $masterKeyName" }
-                setIsStrongBoxBacked(true)
-            } else {
+            if (forceDisableStrongBox) {
                 logToAndroid(Level.DEBUG, "🧩 StrongBox not available")
                 logger.debug { "StrongBox not available or failed test, falling back to TEE for $masterKeyName" }
+                setIsStrongBoxBacked(false)
+            } else {
+                logToAndroid(Level.DEBUG, "🧩 Using StrongBox-backed key for $masterKeyName")
+                logger.debug { "Using StrongBox-backed key for $masterKeyName" }
+                setIsStrongBoxBacked(canUseStrongBox)
             }
         }
 
@@ -137,7 +144,7 @@ class BiometricStorageFile(
         //TODO remove this log
         logToAndroid(
             Level.DEBUG,
-            "🧩readFile $canUseStrongBox | testStrongBoxKey: ${testStrongBoxSupport(context)}"
+            "🧩readFile forceDisableStrongBox: $forceDisableStrongBox}"
         )
         val useCipher = cipher ?: cipherForDecrypt()
 
@@ -161,20 +168,20 @@ class BiometricStorageFile(
             logger.error(ex) {
                 "AEADBadTagException while decrypting $fileV2 — deleting key+file and triggering migration"
             }
-            deleteFile()
+            setSandboxFlag()
             throw MigrationRequiredException()
         } catch (ex: IllegalBlockSizeException) {
             logger.error(ex) {
                 "IllegalBlockSizeException while decrypting $fileV2 — deleting key+file and triggering migration"
             }
-            deleteFile()
+            setSandboxFlag()
             throw MigrationRequiredException(ex)
         } catch (ex: Exception) {
             //TODO what about wrong finger or face
             logger.error(ex) {
                 "Unexpected crypto error while decrypting $fileV2 — deleting key+file and triggering migration"
             }
-            deleteFile()
+            setSandboxFlag()
             throw MigrationRequiredException(ex)
         }
 
@@ -208,7 +215,7 @@ class BiometricStorageFile(
                 .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                 .setKeySize(256)
-                .setUserAuthenticationRequired(false)
+                .setUserAuthenticationRequired(true)
                 .setIsStrongBoxBacked(true)
 
             val keyGenerator = KeyGenerator.getInstance(
@@ -235,8 +242,55 @@ class BiometricStorageFile(
         } catch (e: Exception) {
             false
         } finally {
-            try { ks.deleteEntry(testKeyName) } catch (_: Exception) {}
+            try {
+                ks.deleteEntry(testKeyName)
+            } catch (_: Exception) {
+            }
         }
     }
 
+    private fun hasSandboxFlag(): Boolean {
+        return try {
+            val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            ks.containsAlias(SANDBOX_FLAG_ALIAS)
+        } catch (e: Exception) {
+            logger.error(e) { "Error checking sandbox flag" }
+            false
+        }
+    }
+
+    private fun setSandboxFlag() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            logger.warn { "Sandbox flag not supported on API < 23" }
+            return
+        }
+
+        try {
+            val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            if (ks.containsAlias(SANDBOX_FLAG_ALIAS)) return
+
+            val generator = KeyGenerator.getInstance(
+                KeyProperties.KEY_ALGORITHM_AES,
+                ANDROID_KEYSTORE
+            )
+
+            val spec = KeyGenParameterSpec.Builder(
+                SANDBOX_FLAG_ALIAS,
+                KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+            )
+                .setKeySize(128)
+                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                .setUserAuthenticationRequired(false)
+                .build()
+
+            generator.init(spec)
+            generator.generateKey()
+
+            logger.warn { "Sandbox flag created — StrongBox disabled for future keys" }
+
+        } catch (e: Exception) {
+            logger.error(e) { "Failed to create sandbox flag" }
+        }
+    }
 }
